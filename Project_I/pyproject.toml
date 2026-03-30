@@ -3,16 +3,36 @@ name = "project-i"
 version = "0.1.0"
 description = ""
 authors = [
-    {name = "Your Name",email = "you@example.com"}
+    {name = "Mykyta Zaizzhai",email = "zaizzmyk@cvut.cz"}
 ]
 readme = "README.md"
-requires-python = ">=3.12"
+requires-python = ">=3.11,<3.14"
 dependencies = [
+    "pandas (>=2.0,<4.0.0)",
+    "numpy (>=2.3,<3.0.0)",
+    "matplotlib (>=3.9,<4.0.0)",
+    "seaborn (>=0.13.2,<0.14.0)",
+    "plotly (>=6.6.0,<7.0.0)",
+    "calplot (>=0.1.7.5,<0.2.0.0)",
+    "scipy (>=1.16,<2.0.0)",
+    "statsmodels (>=0.14.6,<0.15.0)",
+    "scikit-learn (>=1.8.0,<2.0.0)",
+    "ydata-profiling (>=4.18.1,<5.0.0)",
+    "setuptools (<81)",
+    "ipywidgets (>=8.1.8,<9.0.0)",
+    "nbformat (>=4.2.0)",
+    "hmmlearn (>=0.3.3,<0.4.0)",
+    "ruptures (>=1.1.10,<2.0.0)"
 ]
 
 [tool.poetry]
-packages = [{include = "project_i", from = "src"}]
+package-mode = false
 
 [build-system]
 requires = ["poetry-core>=2.0.0,<3.0.0"]
 build-backend = "poetry.core.masonry.api"
+
+[dependency-groups]
+dev = [
+    "ipykernel (>=7.2.0,<8.0.0)"
+]
