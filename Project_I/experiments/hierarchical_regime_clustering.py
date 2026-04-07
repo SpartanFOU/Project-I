@@ -215,7 +215,7 @@ for W, (X_l2, dates_l2, _) in l2_data.items():
 # ============================================================
 
 W_L2 = 14   # <-- choose window size after inspecting K selection plots
-K_L2 = 6    # <-- choose K after inspecting K selection plots
+K_L2 = 5    # <-- choose K after inspecting K selection plots
 
 X_l2, dates_l2, X_l2_raw = l2_data[W_L2]
 

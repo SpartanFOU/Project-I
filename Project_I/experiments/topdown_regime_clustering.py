@@ -1,4 +1,7 @@
 import sys
+
+from xgboost import XGBRegressor
+from sklearn.linear_model import Ridge
 sys.path.insert(0, r"c:\Projects Python\Project-I\Project-I\Project_I\src")
 
 import os
@@ -120,14 +123,13 @@ print(f"Mode D PCA: {X_D.shape[1]} → {X_pca.shape[1]} dims "
 #      1. detrended rolling mean consumption   (level w/o multi-year drift)
 #      2. rolling std of raw consumption       (variability: semester > break)
 #      3. weekday / weekend consumption ratio  (structure: semester >> break)
-#      4-5. month sin / cos of endpoint        (season anchor)
 #
 #    Lessons applied:
 #      - detrend to remove the building's increasing baseline (seen in W=28 raw result)
-#      - W=28 gives stable, contiguous period blocks (better than W=14)
+#      - W=28 smooths noisy wd/we ratio and raw_std; works well at K=8
 # ============================================================
 
-W_PERIOD = 14
+W_PERIOD = 28
 
 raw_daily_power = raw_vals.mean(axis=1)
 power_series    = pd.Series(raw_daily_power, index=dates_D)
@@ -136,21 +138,23 @@ power_detrended = (
 ).values
 
 dow_arr = dates_D.dayofweek.values
+doy_arr = dates_D.dayofyear.values
 
 
-def build_period_features(power_det, power_raw, dow, W):
+def build_period_features(power_det, power_raw, dow, doy, W):
     """
-    3 features — all derived from consumption patterns, no calendar encoding.
+    5 features — consumption patterns + smooth seasonal anchor.
 
-    month_sin/cos were removed: they step-change at month boundaries and cause
-    the HMM to segment by calendar month rather than by consumption regime.
-    The seasonal signal (summer dip, winter peak) is already present in
-    detrended_mean and raw_std after the 365-day detrend.
+    doy_sin/cos provides a smooth seasonal signal (changes 1/365 per day)
+    that prevents the HMM from relying solely on consumption stats, which
+    are too noisy for stable convergence without an explicit season anchor.
 
     Features:
       1. detrended rolling mean  — level relative to annual baseline
       2. rolling std (raw)       — variability: semester > break
       3. weekday / weekend ratio — structure: active semester >> holiday period
+      4. doy sin of endpoint     — smooth season anchor
+      5. doy cos of endpoint     — smooth season anchor
     """
     rows, idx = [], []
     for d in range(W - 1, len(power_det)):
@@ -164,10 +168,13 @@ def build_period_features(power_det, power_raw, dow, W):
         wend = np.nanmean(we) if len(we) > 0 else np.nan
         ratio = wday / wend if (wend and wend > 0) else np.nan
 
+        d_val = doy[d]
         rows.append([
             np.nanmean(det_win),
             np.nanstd(raw_win),
             ratio,
+            np.sin(2 * np.pi * d_val / 365),
+            np.cos(2 * np.pi * d_val / 365),
         ])
         idx.append(dates_D[d])
 
@@ -176,11 +183,11 @@ def build_period_features(power_det, power_raw, dow, W):
 
 
 X_period_raw, dates_period = build_period_features(
-    power_detrended, raw_daily_power, dow_arr, W_PERIOD
+    power_detrended, raw_daily_power, dow_arr, doy_arr, W_PERIOD
 )
 X_period = StandardScaler().fit_transform(X_period_raw)
 print(f"\nPeriod feature matrix: {X_period.shape}  (W={W_PERIOD}d)")
-print("Features: detrended_mean | raw_std | wd/we_ratio")
+print("Features: detrended_mean | raw_std | wd/we_ratio | doy_sin | doy_cos")
 
 
 # ============================================================
@@ -234,14 +241,23 @@ plt.show()
 #    Adjust K_PERIOD after inspecting BIC plot above
 # ============================================================
 
-K_PERIOD = 6   # <-- adjust after inspecting BIC plot
+K_PERIOD = 8   # <-- adjust after inspecting BIC plot
 
-hmm_period    = GaussianHMM(n_components=K_PERIOD, covariance_type="diag",
-                             n_iter=300, random_state=42, verbose=False)
-hmm_period.fit(X_period)
+# Multi-restart: HMM converges to different local optima depending on init.
+# Pick the run with the highest log-likelihood.
+best_ll, best_hmm = -np.inf, None
+for seed in range(42):
+    hmm = GaussianHMM(n_components=K_PERIOD, covariance_type="diag",
+                      n_iter=300, random_state=seed, verbose=False)
+    hmm.fit(X_period)
+    ll = hmm.score(X_period)
+    if ll > best_ll:
+        best_ll, best_hmm = ll, hmm
+    print(f"  seed={seed:>2}: log-likelihood={ll:.2f}")
+
+hmm_period    = best_hmm
 labels_period = hmm_period.predict(X_period)
-
-print(f"\nHMM log-likelihood (K={K_PERIOD}): {hmm_period.score(X_period):.2f}")
+print(f"\nBest log-likelihood (K={K_PERIOD}): {best_ll:.2f}")
 
 # Transition matrix
 fig, ax = plt.subplots(figsize=(7, 5))
@@ -453,3 +469,30 @@ for p in period_list:
         dow_counts = np.bincount(dates_D[full_mask].dayofweek, minlength=7)
         dow_str    = "  ".join(f"{d:>3.0f}" for d in dow_counts)
         print(f"  P{p}-Sub{s}    {n_days:>5} {pct:>5.1f}%   {dow_str}")
+
+
+# ============================================================
+# 11. Forecast evaluation — does regime splitting help?
+#
+#     Attach period labels back onto the raw 15-min dataframe,
+#     then run the regime forecast evaluator.
+#     dates_D and df.index are both UTC-aware, so reindex works directly.
+# ============================================================
+import importlib
+import project_i.regime_forecast as _rf
+importlib.reload(_rf)
+from project_i.regime_forecast import evaluate_regime_forecast
+
+composite_labels = day_period_labels * K_SUB + sub_labels_per_day
+regime_series = pd.Series(composite_labels, index=dates_D)
+df["regime"] = regime_series.reindex(df.index.normalize()).values
+
+results = evaluate_regime_forecast(
+    df,
+    regime_col="regime",
+    target_col="main_meter_power_kw",
+    test_from="2024-01-01",
+    regime_as_feature=False,
+    model_cls=Ridge,
+    plot=True,
+)
