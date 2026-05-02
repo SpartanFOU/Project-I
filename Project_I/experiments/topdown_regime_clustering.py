@@ -34,10 +34,13 @@ p999 = df["main_meter_power_kw"].quantile(0.999)
 df["main_meter_clean_kw"] = df["main_meter_power_kw"].clip(upper=p999)
 df["solar_irradiance_clean"] = df["solar_irradiance_wm2"].clip(lower=0)
 
-hourly_power  = df["main_meter_clean_kw"].resample("h").mean()
-hourly_solar  = df["solar_irradiance_clean"].resample("h").mean()
-hourly_temp   = df["temp_c"].resample("h").mean()
-hourly_motors = df["motors_power_kw"].resample("h").mean()
+df_local = df.copy()
+df_local.index = df.index.tz_convert("Europe/Prague")
+
+hourly_power  = df_local["main_meter_clean_kw"].resample("h").mean()
+hourly_solar  = df_local["solar_irradiance_clean"].resample("h").mean()
+hourly_temp   = df_local["temp_c"].resample("h").mean()
+hourly_motors = df_local["motors_power_kw"].resample("h").mean()
 
 print(f"Hourly power: {len(hourly_power)} rows, {hourly_power.isna().mean():.1%} missing")
 
@@ -57,6 +60,21 @@ daily_pivot = hourly_df.pivot_table(
 valid_hours = daily_pivot.notna().sum(axis=1)
 daily_pivot = daily_pivot[valid_hours >= 18]
 daily_pivot = daily_pivot.interpolate(axis=1, limit=3).dropna()
+
+# Compare mean peak hour in UTC-pivot for winter vs summer days
+winter_days = daily_pivot[daily_pivot.index.month.isin([12, 1, 2])]
+summer_days = daily_pivot[daily_pivot.index.month.isin([6, 7, 8])]
+
+print("Mean peak UTC hour — winter:", winter_days.mean().idxmax())
+print("Mean peak UTC hour — summer:", summer_days.mean().idxmax())
+# Expect summer peak ~1 column earlier than winter if DST shift is present
+
+# Check row count on DST transition days (last Sunday of March/October)
+dst_days = ["2024-03-31", "2024-10-27", "2023-03-26", "2023-10-29"]
+for d in dst_days:
+    count = daily_pivot.index[daily_pivot.index.normalize() == pd.Timestamp(d).normalize()]
+    print(f"{d}: {daily_pivot.loc[d].notna().sum()} valid hours")
+
 
 raw_values  = daily_pivot.values.copy()
 dates_daily = pd.DatetimeIndex(daily_pivot.index)
@@ -202,7 +220,7 @@ print("Features: detrended_mean | raw_std | wd/we_ratio | doy_sin | doy_cos")
 #    BIC = -2 * log_likelihood + n_params * log(n_samples)
 # ============================================================
 
-K_range    = range(2, 10)
+K_range    = range(6, 14)
 hmm_scores = []
 
 print("\n--- Period HMM K selection (BIC) ---")
@@ -241,7 +259,7 @@ plt.show()
 #    Adjust K_PERIOD after inspecting BIC plot above
 # ============================================================
 
-K_PERIOD = 8   # <-- adjust after inspecting BIC plot
+K_PERIOD = 7  # <-- adjust after inspecting BIC plot
 
 # Multi-restart: HMM converges to different local optima depending on init.
 # Pick the run with the highest log-likelihood.
@@ -271,6 +289,39 @@ plt.show()
 eval_period = ClusterEvaluator(X_period, labels_period, dates_period,
                                 name=f"HMM Period K={K_PERIOD} W={W_PERIOD}d")
 eval_period.plot_all()
+
+
+# ============================================================
+# 6a. Period cluster distances
+#     Pairwise Euclidean distances between HMM state means
+#     (in standardized 5-feature space).
+#     Close pairs share similar rolling-window consumption patterns
+#     and may be candidates for merging; distant pairs are distinct.
+# ============================================================
+
+period_centroids = hmm_period.means_   # shape (K_PERIOD, n_features)
+diff_p = period_centroids[:, None, :] - period_centroids[None, :, :]
+period_dist = np.sqrt((diff_p ** 2).sum(axis=-1))
+period_dist_df = pd.DataFrame(
+    period_dist,
+    index=[f"P{i}" for i in range(K_PERIOD)],
+    columns=[f"P{i}" for i in range(K_PERIOD)],
+)
+
+fig, ax = plt.subplots(figsize=(7, 5))
+sns.heatmap(period_dist_df, annot=True, fmt=".2f", cmap="YlOrRd",
+            mask=np.eye(K_PERIOD, dtype=bool), linewidths=0.5, ax=ax)
+ax.set_title(f"Period Cluster — Pairwise Centroid Distances  (K={K_PERIOD}, Euclidean, scaled feature space)")
+plt.tight_layout()
+plt.show()
+
+period_pairs = sorted(
+    (period_dist[i, j], i, j)
+    for i in range(K_PERIOD) for j in range(i + 1, K_PERIOD)
+)
+print("\nPeriod cluster pairwise distances (sorted closest → farthest):")
+for dist, i, j in period_pairs:
+    print(f"  P{i} ↔ P{j}: {dist:.3f}")
 
 
 # ============================================================
@@ -328,6 +379,12 @@ for p in sorted(np.unique(day_period_labels)):
 
     km_sub   = KMeans(n_clusters=K_SUB, n_init=10, random_state=42)
     sub_labs = km_sub.fit_predict(X_sub)
+
+    # S0 = higher mean consumption, S1 = lower (workday vs weekend/holiday)
+    mean_pw = np.array([raw_sub[sub_labs == s].mean() for s in range(K_SUB)])
+    if mean_pw[0] < mean_pw[1]:
+        sub_labs = 1 - sub_labs
+
     period_sub_results[p] = sub_labs
 
     # Write sub-labels back to the full array
@@ -376,6 +433,42 @@ for p in sorted(np.unique(day_period_labels)):
 
     # Sub-cluster timeline (within this period's days)
     eval_sub.plot_timeline()
+
+
+# ============================================================
+# 8a. Composite cluster distances
+#     Pairwise Euclidean distances between composite (period × sub)
+#     cluster centroids in PCA space (Mode D features).
+#     Reveals which combined regime types are similar in daily shape.
+# ============================================================
+
+comp_labels_tmp = day_period_labels * K_SUB + sub_labels_per_day
+comp_unique     = sorted(np.unique(comp_labels_tmp))
+comp_names      = [f"P{c // K_SUB}-S{c % K_SUB}" for c in comp_unique]
+comp_cents      = np.array([
+    X_pca[comp_labels_tmp == c].mean(axis=0) for c in comp_unique
+])
+diff_c    = comp_cents[:, None, :] - comp_cents[None, :, :]
+comp_dist = np.sqrt((diff_c ** 2).sum(axis=-1))
+comp_dist_df = pd.DataFrame(comp_dist, index=comp_names, columns=comp_names)
+
+fig, ax = plt.subplots(figsize=(9, 7))
+sns.heatmap(comp_dist_df, annot=True, fmt=".2f", cmap="YlOrRd",
+            mask=np.eye(len(comp_unique), dtype=bool), linewidths=0.5, ax=ax)
+ax.set_title(
+    f"Composite Cluster — Pairwise Centroid Distances  "
+    f"(K_period={K_PERIOD}, K_sub={K_SUB}, Euclidean, PCA space)"
+)
+plt.tight_layout()
+plt.show()
+
+comp_pairs = sorted(
+    (comp_dist[i, j], comp_names[i], comp_names[j])
+    for i in range(len(comp_unique)) for j in range(i + 1, len(comp_unique))
+)
+print("\nComposite cluster pairwise distances (sorted closest → farthest):")
+for dist, la, lb in comp_pairs:
+    print(f"  {la} ↔ {lb}: {dist:.3f}")
 
 
 # ============================================================
@@ -472,7 +565,150 @@ for p in period_list:
 
 
 # ============================================================
-# 11. Forecast evaluation — does regime splitting help?
+# 11. Academic calendar compliance
+#
+#     Label each day with its official FS ČVUT academic period
+#     (from Casovy_plan PDFs — covers 2024-09-23 to 2026-03-09).
+#     Days outside that range get "unknown".
+#
+#     Contingency heatmap (row-normalised): shows what fraction of
+#     each academic period ends up in each composite cluster.
+#     A good clustering should concentrate each academic period into
+#     one or two clusters rather than spreading it evenly.
+# ============================================================
+import importlib
+import project_i.calendar as _cal
+importlib.reload(_cal)
+from project_i.calendar import label_academic_period
+
+
+composite_labels = day_period_labels * K_SUB + sub_labels_per_day
+academic_labels  = label_academic_period(dates_D)
+
+cal_mask = academic_labels != "unknown"
+if cal_mask.sum() > 0:
+    ct = pd.crosstab(
+        academic_labels[cal_mask],
+        composite_labels[cal_mask],
+        rownames=["academic_period"],
+        colnames=["composite_cluster"],
+    )
+    ct_norm = ct.div(ct.sum(axis=1), axis=0) * 100   # row-normalised %
+
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(16, 5))
+
+    sns.heatmap(ct, annot=True, fmt="d", cmap="Blues", ax=ax1)
+    ax1.set_title("Cluster × Academic period — counts")
+
+    sns.heatmap(ct_norm, annot=True, fmt=".1f", cmap="YlOrRd", ax=ax2,
+                vmin=0, vmax=100)
+    ax2.set_title("Cluster × Academic period — row % (how each period distributes across clusters)")
+
+    plt.suptitle(
+        f"Academic calendar compliance  (K_period={K_PERIOD}, K_sub={K_SUB}, W={W_PERIOD}d)",
+        fontsize=13,
+    )
+    plt.tight_layout()
+    plt.show()
+
+    print(f"\nAcademic period coverage in data: {cal_mask.sum()} days")
+    print(ct_norm.to_string(float_format="{:.1f}%".format))
+
+    # --- Composite timeline with academic period overlays ---
+    ACAD_COLORS = {
+        "teaching_winter":    ("#1565C0", "Teaching (winter)"),
+        "teaching_summer":    ("#2E7D32", "Teaching (summer)"),
+        "exam_winter":        ("#E65100", "Exams (winter)"),
+        "exam_summer":        ("#B71C1C", "Exams (summer)"),
+        "christmas_break":    ("#0288D1", "Christmas break"),
+        "summer_break":       ("#00838F", "Summer break"),
+        "extraordinary_exam": ("#6A1B9A", "Extraordinary exams"),
+    }
+
+    # Build contiguous (year, label, doy_start, doy_end) spans
+    acad_df = pd.DataFrame({"date": dates_D, "label": academic_labels.values})
+    acad_df = acad_df[acad_df["label"] != "unknown"].copy()
+    acad_df["year"] = acad_df["date"].dt.year
+    acad_df["doy"]  = acad_df["date"].dt.dayofyear
+    acad_df["run"]  = (acad_df["label"] != acad_df["label"].shift()).cumsum()
+
+    spans = [
+        (year, lbl, grp["doy"].min(), grp["doy"].max() + 1)
+        for (year, lbl, _), grp in acad_df.groupby(["year", "label", "run"])
+    ]
+
+    fig, axes = plt.subplots(len(years), 1,
+                              figsize=(20, 1.1 * len(years) + 2),
+                              sharex=True, squeeze=False)
+    axes = axes.flatten()
+
+    CLUSTER_Y = 0.25    # centre of cluster lane
+    ACAD_Y    = -0.45   # centre of academic lane
+    CLUSTER_H = 0.45
+    ACAD_H    = 0.25
+
+    for i, year in enumerate(years):
+        ax      = axes[i]
+        ymask   = dates_D.year == year
+        ydates  = dates_D[ymask]
+        yperiod = day_period_labels[ymask]
+        ysub    = sub_labels_per_day[ymask]
+
+        # top lane — cluster colours
+        for doy, p, s in zip(ydates.dayofyear, yperiod, ysub):
+            ax.barh(CLUSTER_Y, 1, left=doy, height=CLUSTER_H,
+                    color=composite_color(p, s), edgecolor="none")
+
+        # bottom lane — academic period colours
+        for span_year, lbl, doy_s, doy_e in spans:
+            if span_year == year and lbl in ACAD_COLORS:
+                ax.barh(ACAD_Y, doy_e - doy_s, left=doy_s, height=ACAD_H,
+                        color=ACAD_COLORS[lbl][0], edgecolor="none")
+
+        # divider between lanes
+        ax.axhline(0, color="white", linewidth=1.2)
+
+        ax.set_yticks([CLUSTER_Y, ACAD_Y])
+        ax.set_yticklabels(["", ""], fontsize=7)
+        ax.set_ylabel(str(year), fontsize=10, rotation=0, labelpad=30, va="center")
+        ax.set_xlim(1, 366)
+        ax.set_ylim(-0.65, 0.55)
+        for ms in month_starts[1:]:
+            ax.axvline(ms, color="white", linewidth=0.8, alpha=0.6)
+        ax.set_xticks(month_starts)
+        ax.set_xticklabels(month_names if i == len(years) - 1 else [], fontsize=9)
+        ax.tick_params(axis="x", length=3)
+        for spine in ax.spines.values():
+            spine.set_visible(False)
+
+    patches_clusters = [
+        mpatches.Patch(facecolor=composite_color(p, s), label=f"P{p}-S{s}")
+        for p in period_list
+        for s in range(K_SUB if day_period_labels[day_period_labels == p].sum() >= MIN_DAYS else 1)
+    ]
+    patches_acad = [
+        mpatches.Patch(facecolor=color, alpha=0.9, label=name)
+        for color, name in ACAD_COLORS.values()
+    ]
+    fig.legend(handles=patches_clusters + patches_acad,
+               loc="upper right", fontsize=8,
+               ncol=min(len(patches_clusters) + len(patches_acad), 12),
+               frameon=True, edgecolor="gray")
+    plt.suptitle(
+        f"Composite Regime Timeline + Academic Calendar  (K={K_PERIOD}, K_sub={K_SUB}, W={W_PERIOD}d)\n"
+        f"Top lane: detected clusters   |   Bottom lane: academic periods (2016–2026, gap 2021–2024 filled)",
+        fontsize=12, y=1.01,
+    )
+    plt.tight_layout()
+    plt.subplots_adjust(hspace=0.08)
+    plt.show()
+
+else:
+    print("No overlap between data and academic calendar — check date ranges.")
+
+
+# ============================================================
+# 12. Forecast evaluation — does regime splitting help?
 #
 #     Attach period labels back onto the raw 15-min dataframe,
 #     then run the regime forecast evaluator.
@@ -483,9 +719,8 @@ import project_i.regime_forecast as _rf
 importlib.reload(_rf)
 from project_i.regime_forecast import evaluate_regime_forecast
 
-composite_labels = day_period_labels * K_SUB + sub_labels_per_day
 regime_series = pd.Series(composite_labels, index=dates_D)
-df["regime"] = regime_series.reindex(df.index.normalize()).values
+df["regime"] = regime_series.reindex(df.index.tz_convert("Europe/Prague").normalize()).values
 
 results = evaluate_regime_forecast(
     df,
